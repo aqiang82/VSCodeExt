@@ -272,12 +272,6 @@ class DartObxWrapCodeActionProvider implements vscode.CodeActionProvider {
 			title: 'Wrap with GetBuilder'
 		};
 
-		const widgetAction = new vscode.CodeAction('Wrap with Widget (child)', vscode.CodeActionKind.RefactorRewrite);
-		widgetAction.command = {
-			command: 'flutterTools.wrapWithWidget',
-			title: 'Wrap with Widget (child)'
-		};
-
 		const selectFunctionAction = new vscode.CodeAction('Select Current Function', vscode.CodeActionKind.RefactorRewrite);
 		selectFunctionAction.command = {
 			command: 'flutterTools.selectCurrentFunction',
@@ -290,7 +284,6 @@ class DartObxWrapCodeActionProvider implements vscode.CodeActionProvider {
 			futureBuilderAction,
 			layoutBuilderAction,
 			getBuilderAction,
-			widgetAction,
 			selectFunctionAction
 		];
 	}
