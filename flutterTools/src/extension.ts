@@ -27,10 +27,423 @@ export function activate(context: vscode.ExtensionContext) {
 		vscode.commands.registerCommand('flutterTools.extractWidgetToFile', extractWidgetToFile)
 	);
 
+	context.subscriptions.push(
+		vscode.commands.registerCommand('flutterTools.wrapWithObx', wrapWithObxFunction)
+	);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand('flutterTools.wrapWithObxBlock', wrapWithObxBlockFunction)
+	);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand('flutterTools.wrapWithFutureBuilder', wrapWithFutureBuilderFunction)
+	);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand('flutterTools.wrapWithLayoutBuilder', wrapWithLayoutBuilderFunction)
+	);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand('flutterTools.wrapWithGetBuilder', wrapWithGetBuilderFunction)
+	);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand('flutterTools.selectCurrentFunction', selectCurrentFunctionFunction)
+	);
+
+	context.subscriptions.push(
+		vscode.languages.registerCodeActionsProvider(
+			{ language: 'dart', scheme: 'file' },
+			new DartObxWrapCodeActionProvider(),
+			{ providedCodeActionKinds: [vscode.CodeActionKind.RefactorRewrite] }
+		)
+	);
+
 	// deepSeek 命令，暂时没用
 	// let askDeepSeek = vscode.commands.registerCommand('flutterTools.askDeepSeek', askDeepSeekFunction);
 	// context.subscriptions.push(askDeepSeek);
 
+}
+
+type WidgetOffsets = {
+	start: number;
+	end: number;
+};
+
+type FunctionOffsets = {
+	start: number;
+	end: number;
+};
+
+function findWidgetOffsets(text: string, cursorOffset: number, includeTrailingComma: boolean): WidgetOffsets | undefined {
+	const safeOffset = Math.max(0, Math.min(cursorOffset, text.length));
+	const rightChar = safeOffset < text.length ? text[safeOffset] : '';
+	const leftChar = safeOffset > 0 ? text[safeOffset - 1] : '';
+
+	let widgetStartParen = -1;
+	let rightParenOffset = -1;
+
+	if (rightChar === ')') {
+		rightParenOffset = safeOffset;
+	} else if (leftChar === ')') {
+		rightParenOffset = safeOffset - 1;
+	}
+
+	if (rightParenOffset >= 0) {
+		let depth = 0;
+		for (let i = rightParenOffset; i >= 0; i--) {
+			if (text[i] === ')') {
+				depth++;
+			} else if (text[i] === '(') {
+				depth--;
+				if (depth === 0) {
+					widgetStartParen = i;
+					break;
+				}
+			}
+		}
+	} else {
+		let i = safeOffset;
+		while (i > 0 && text[i] !== '(') {
+			i--;
+		}
+		if (text[i] === '(') {
+			widgetStartParen = i;
+		}
+	}
+
+	if (widgetStartParen < 0) {
+		return undefined;
+	}
+
+	let start = widgetStartParen;
+	while (start > 0 && /[a-zA-Z0-9_.]/.test(text[start - 1])) {
+		start--;
+	}
+
+	let end = safeOffset;
+	let openParen = 0;
+	let foundStart = false;
+
+	for (let i = start; i < text.length; i++) {
+		if (text[i] === '(') {
+			openParen++;
+			foundStart = true;
+		} else if (text[i] === ')') {
+			openParen--;
+		}
+
+		if (foundStart && openParen === 0) {
+			end = i + 1;
+			break;
+		}
+	}
+
+	if (includeTrailingComma && end < text.length && text[end] === ',') {
+		end += 1;
+	}
+
+	if (end <= start) {
+		return undefined;
+	}
+
+	return { start, end };
+}
+
+function getGetImportInsertPosition(document: vscode.TextDocument): vscode.Position {
+	let lastImportLine = -1;
+	for (let i = 0; i < document.lineCount; i++) {
+		const lineText = document.lineAt(i).text.trim();
+		if (lineText.startsWith('import ')) {
+			lastImportLine = i;
+		}
+	}
+
+	if (lastImportLine >= 0) {
+		return document.lineAt(lastImportLine).range.end;
+	}
+
+	return new vscode.Position(0, 0);
+}
+
+function findFunctionOffsets(text: string, cursorOffset: number): FunctionOffsets | undefined {
+	const safeOffset = Math.max(0, Math.min(cursorOffset, text.length));
+	// 匹配 Dart 函数头：支持注解、返回类型、泛型参数、async、块函数/箭头函数。
+	const functionRegex = /(^|\n)\s*(?:@[^\n]+\n\s*)*(?:[A-Za-z_][\w<>,\?\s\[\]\.]*\s+)?([A-Za-z_]\w*)\s*(?:<[^>{}\n]*>)?\s*\([^;{}]*\)\s*(?:async\s*)?(=>|{)/gm;
+	const excluded = new Set(['if', 'for', 'while', 'switch', 'catch']);
+
+	let best: FunctionOffsets | undefined;
+	let match: RegExpExecArray | null;
+
+	while ((match = functionRegex.exec(text)) !== null) {
+		const leading = match[1] ?? '';
+		const name = match[2];
+		if (!name || excluded.has(name)) {
+			continue;
+		}
+
+		const start = match.index + leading.length;
+		const matchText = match[0].slice(leading.length);
+		const isArrow = match[3] === '=>';
+
+		let end = -1;
+		if (isArrow) {
+			// 箭头函数以分号结尾，选中到 ;
+			const arrowIndex = start + matchText.lastIndexOf('=>');
+			const semicolonIndex = text.indexOf(';', arrowIndex + 2);
+			if (semicolonIndex < 0) {
+				continue;
+			}
+			end = semicolonIndex + 1;
+		} else {
+			// 块函数按大括号深度配对，选中到对应 }
+			const braceOpenIndex = start + matchText.lastIndexOf('{');
+			let depth = 0;
+			for (let i = braceOpenIndex; i < text.length; i++) {
+				if (text[i] === '{') {
+					depth++;
+				} else if (text[i] === '}') {
+					depth--;
+					if (depth === 0) {
+						end = i + 1;
+						break;
+					}
+				}
+			}
+			if (end < 0) {
+				continue;
+			}
+		}
+
+		if (safeOffset < start || safeOffset > end) {
+			continue;
+		}
+
+		// 光标命中多个函数时，优先最小包围范围（通常是最内层函数）
+		if (!best || (end - start) < (best.end - best.start)) {
+			best = { start, end };
+		}
+	}
+
+	return best;
+}
+
+class DartObxWrapCodeActionProvider implements vscode.CodeActionProvider {
+	provideCodeActions(document: vscode.TextDocument, range: vscode.Range): vscode.CodeAction[] {
+		if (document.languageId !== 'dart') {
+			return [];
+		}
+
+		const hasSelection = !range.isEmpty;
+		const canDetectWidget = !!findWidgetOffsets(document.getText(), document.offsetAt(range.start), true);
+		const canDetectFunction = !!findFunctionOffsets(document.getText(), document.offsetAt(range.start));
+		// 只有能确定目标时才展示 Rewrite 动作，减少无效噪音。
+		if (!hasSelection && !canDetectWidget && !canDetectFunction) {
+			return [];
+		}
+
+		const action = new vscode.CodeAction('Wrap with Obx', vscode.CodeActionKind.RefactorRewrite);
+		action.command = {
+			command: 'flutterTools.wrapWithObx',
+			title: 'Wrap with Obx'
+		};
+
+		const blockAction = new vscode.CodeAction('Wrap with Obx (block)', vscode.CodeActionKind.RefactorRewrite);
+		blockAction.command = {
+			command: 'flutterTools.wrapWithObxBlock',
+			title: 'Wrap with Obx (block)'
+		};
+
+		const futureBuilderAction = new vscode.CodeAction('Wrap with FutureBuilder', vscode.CodeActionKind.RefactorRewrite);
+		futureBuilderAction.command = {
+			command: 'flutterTools.wrapWithFutureBuilder',
+			title: 'Wrap with FutureBuilder'
+		};
+
+		const layoutBuilderAction = new vscode.CodeAction('Wrap with LayoutBuilder', vscode.CodeActionKind.RefactorRewrite);
+		layoutBuilderAction.command = {
+			command: 'flutterTools.wrapWithLayoutBuilder',
+			title: 'Wrap with LayoutBuilder'
+		};
+
+		const getBuilderAction = new vscode.CodeAction('Wrap with GetBuilder', vscode.CodeActionKind.RefactorRewrite);
+		getBuilderAction.command = {
+			command: 'flutterTools.wrapWithGetBuilder',
+			title: 'Wrap with GetBuilder'
+		};
+
+		const widgetAction = new vscode.CodeAction('Wrap with Widget (child)', vscode.CodeActionKind.RefactorRewrite);
+		widgetAction.command = {
+			command: 'flutterTools.wrapWithWidget',
+			title: 'Wrap with Widget (child)'
+		};
+
+		const selectFunctionAction = new vscode.CodeAction('Select Current Function', vscode.CodeActionKind.RefactorRewrite);
+		selectFunctionAction.command = {
+			command: 'flutterTools.selectCurrentFunction',
+			title: 'Select Current Function'
+		};
+
+		return [
+			action,
+			blockAction,
+			futureBuilderAction,
+			layoutBuilderAction,
+			getBuilderAction,
+			widgetAction,
+			selectFunctionAction
+		];
+	}
+}
+
+function selectCurrentFunctionFunction() {
+	const editor = vscode.window.activeTextEditor;
+	if (!editor) {
+		vscode.window.showInformationMessage('No active editor');
+		return;
+	}
+
+	const document = editor.document;
+	const cursorOffset = document.offsetAt(editor.selection.active);
+	// 选中函数签名+实现体，覆盖返回值、函数名、参数与函数体。
+	const offsets = findFunctionOffsets(document.getText(), cursorOffset);
+
+	if (!offsets) {
+		vscode.window.showInformationMessage('No function found at cursor.');
+		return;
+	}
+
+	const startPos = document.positionAt(offsets.start);
+	const endPos = document.positionAt(offsets.end);
+	editor.selection = new vscode.Selection(startPos, endPos);
+	editor.revealRange(new vscode.Range(startPos, endPos));
+	vscode.window.showInformationMessage('Function selected.');
+}
+
+async function wrapWithObxFunction() {
+	await wrapWithObxByStyle('arrow');
+}
+
+async function wrapWithObxBlockFunction() {
+	await wrapWithObxByStyle('block');
+}
+
+async function wrapWithFutureBuilderFunction() {
+	await wrapWithTemplate({
+		buildWrappedText: (body, suffix) => `FutureBuilder<dynamic>(\n  future: null,\n  builder: (context, snapshot) {\n    if (snapshot.connectionState == ConnectionState.waiting) {\n      return const CircularProgressIndicator();\n    }\n    return ${body};\n  },\n)${suffix}`,
+		successMessage: 'Wrapped with FutureBuilder.'
+	});
+}
+
+async function wrapWithLayoutBuilderFunction() {
+	await wrapWithTemplate({
+		buildWrappedText: (body, suffix) => `LayoutBuilder(\n  builder: (context, constraints) {\n    return ${body};\n  },\n)${suffix}`,
+		successMessage: 'Wrapped with LayoutBuilder.'
+	});
+}
+
+async function wrapWithGetBuilderFunction() {
+	await wrapWithTemplate({
+		buildWrappedText: (body, suffix) => `GetBuilder<dynamic>(\n  builder: (controller) {\n    return ${body};\n  },\n)${suffix}`,
+		successMessage: 'Wrapped with GetBuilder.',
+		requireGetImport: true
+	});
+}
+
+function splitTrailingComma(text: string): { body: string; hasTrailingComma: boolean } {
+	const match = text.match(/,(\s*)$/);
+	if (!match || match.index === undefined) {
+		return { body: text, hasTrailingComma: false };
+	}
+
+	return {
+		body: text.slice(0, match.index).trimEnd(),
+		hasTrailingComma: true
+	};
+}
+
+function resolveWrapTargetRange(editor: vscode.TextEditor): vscode.Range | undefined {
+	const document = editor.document;
+	const selection = editor.selection;
+
+	if (!selection.isEmpty) {
+		return selection;
+	}
+
+	const offsets = findWidgetOffsets(document.getText(), document.offsetAt(selection.active), true);
+	if (!offsets) {
+		return undefined;
+	}
+
+	return new vscode.Range(document.positionAt(offsets.start), document.positionAt(offsets.end));
+}
+
+type WrapTemplateOptions = {
+	buildWrappedText: (body: string, suffix: string) => string;
+	successMessage: string;
+	requireGetImport?: boolean;
+};
+
+async function wrapWithTemplate(options: WrapTemplateOptions) {
+	const editor = vscode.window.activeTextEditor;
+	if (!editor) {
+		vscode.window.showInformationMessage('No active editor');
+		return;
+	}
+
+	const document = editor.document;
+	if (document.languageId !== 'dart') {
+		vscode.window.showInformationMessage('Wrap only supports Dart files.');
+		return;
+	}
+
+	const targetRange = resolveWrapTargetRange(editor);
+	if (!targetRange) {
+		vscode.window.showInformationMessage('No widget found at cursor.');
+		return;
+	}
+
+	const selectedText = document.getText(targetRange);
+	if (!selectedText.trim()) {
+		vscode.window.showInformationMessage('No widget found at cursor.');
+		return;
+	}
+
+	const parsed = splitTrailingComma(selectedText);
+	const suffix = parsed.hasTrailingComma ? ',' : '';
+	const wrapped = options.buildWrappedText(parsed.body, suffix);
+
+	const hasGetImport = /import\s+['"]package:get\/get\.dart['"];/.test(document.getText());
+	const importInsertPos = options.requireGetImport && !hasGetImport
+		? getGetImportInsertPosition(document)
+		: undefined;
+
+	const ok = await editor.edit(editBuilder => {
+		if (importInsertPos) {
+			const importText = importInsertPos.line === 0 && importInsertPos.character === 0
+				? `import 'package:get/get.dart';\n\n`
+				: `\nimport 'package:get/get.dart';`;
+			editBuilder.insert(importInsertPos, importText);
+		}
+		editBuilder.replace(targetRange, wrapped);
+	});
+
+	if (!ok) {
+		vscode.window.showErrorMessage('Wrap failed.');
+		return;
+	}
+
+	vscode.window.showInformationMessage(options.successMessage);
+}
+
+async function wrapWithObxByStyle(style: 'arrow' | 'block') {
+	await wrapWithTemplate({
+		buildWrappedText: (body, suffix) => style === 'arrow'
+			? `Obx(() => ${body})${suffix}`
+			: `Obx(() {\n  return ${body};\n})${suffix}`,
+		successMessage: style === 'arrow' ? 'Wrapped with Obx.' : 'Wrapped with Obx (block).',
+		requireGetImport: true
+	});
 }
 
 async function askDeepSeekFunction() {
@@ -314,38 +727,15 @@ function selectCurrentWidgetFunction() {
 	const document = editor.document;
 	const position = editor.selection.active;
 	const text = document.getText();
+	const offsets = findWidgetOffsets(text, document.offsetAt(position), true);
 
-	const cursorOffset = document.offsetAt(position);
-
-	// 向左找 widget 起始的括号
-	let start = cursorOffset;
-	while (start > 0 && text[start] !== '(') {
-		start--;
+	if (!offsets) {
+		vscode.window.showInformationMessage('No widget found at cursor.');
+		return;
 	}
 
-	// 向左找 widget 名字（包含 . 点）
-	while (start > 0 && /[a-zA-Z0-9_.]/.test(text[start - 1])) {
-		start--;
-	}
-
-	// 向右找 widget 结尾（括号平衡）
-	let end = cursorOffset;
-	let openParen = 0;
-	let foundStart = false;
-
-	for (let i = start; i < text.length; i++) {
-		if (text[i] === '(') {
-			openParen++;
-			foundStart = true;
-		} else if (text[i] === ')') {
-			openParen--;
-		}
-
-		if (foundStart && openParen === 0) {
-			end = i + 1;
-			break;
-		}
-	}
+	const start = offsets.start;
+	const end = offsets.end;
 
 	if (end > start) {
 		const startPos = document.positionAt(start);

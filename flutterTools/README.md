@@ -12,7 +12,7 @@ flutterTools.generateConstructorParams
 根据当前的光标，生成当前类的构造函数和参数。
 
 flutterTools.generateGetXModule
-生成一套基本的公用的getX模版,支持驼峰命名和下划线命名
+生成一套基本的公用的getX模版,支持驼峰命名和下划线命名(目录哪里右键会出现)
 
 #开发说明
 记住运行之前先用命令编译才会生效：

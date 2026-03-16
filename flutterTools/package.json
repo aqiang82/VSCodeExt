@@ -2,14 +2,16 @@
   "name": "flutter-tools",
   "displayName": "flutterTools",
   "description": "flutter tools",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "engines": {
     "vscode": "^1.101.0"
   },
   "categories": [
     "Other"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "onLanguage:dart"
+  ],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
@@ -28,6 +30,30 @@
       {
         "command": "flutterTools.extractWidgetToFile",
         "title": "Flutter Tools: Extract Widget to File (Stateless)"
+      },
+      {
+        "command": "flutterTools.wrapWithObx",
+        "title": "Flutter Tools: Wrap with Obx"
+      },
+      {
+        "command": "flutterTools.wrapWithObxBlock",
+        "title": "Flutter Tools: Wrap with Obx (Block)"
+      },
+      {
+        "command": "flutterTools.wrapWithFutureBuilder",
+        "title": "Flutter Tools: Wrap with FutureBuilder"
+      },
+      {
+        "command": "flutterTools.wrapWithLayoutBuilder",
+        "title": "Flutter Tools: Wrap with LayoutBuilder"
+      },
+      {
+        "command": "flutterTools.wrapWithGetBuilder",
+        "title": "Flutter Tools: Wrap with GetBuilder"
+      },
+      {
+        "command": "flutterTools.selectCurrentFunction",
+        "title": "Flutter Tools: Select Current Function"
       }
     ],
     "menus": {
