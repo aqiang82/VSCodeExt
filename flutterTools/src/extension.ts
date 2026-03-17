@@ -52,6 +52,10 @@ export function activate(context: vscode.ExtensionContext) {
 	);
 
 	context.subscriptions.push(
+		vscode.commands.registerCommand('flutterTools.generateOverrideMethods', generateOverrideMethodsFunction)
+	);
+
+	context.subscriptions.push(
 		vscode.languages.registerCodeActionsProvider(
 			{ language: 'dart', scheme: 'file' },
 			new DartObxWrapCodeActionProvider(),
@@ -73,6 +77,20 @@ type WidgetOffsets = {
 type FunctionOffsets = {
 	start: number;
 	end: number;
+};
+
+type DartClassContext = {
+	name: string;
+	start: number;
+	end: number;
+	bodyStart: number;
+	bodyEnd: number;
+	header: string;
+	extendsName?: string;
+	stateWidgetType?: string;
+	implementsNames: string[];
+	methodNames: Set<string>;
+	indent: string;
 };
 
 function findWidgetOffsets(text: string, cursorOffset: number, includeTrailingComma: boolean): WidgetOffsets | undefined {
@@ -228,6 +246,162 @@ function findFunctionOffsets(text: string, cursorOffset: number): FunctionOffset
 	return best;
 }
 
+function stripTypeArgs(typeName: string): string {
+	return typeName.replace(/<[^>]*>/g, '').trim();
+}
+
+function findCurrentClassContext(text: string, cursorOffset: number): DartClassContext | undefined {
+	const classRegex = /\bclass\s+([A-Za-z_]\w*)[^\{]*\{/g;
+	let match: RegExpExecArray | null;
+
+	while ((match = classRegex.exec(text)) !== null) {
+		const className = match[1];
+		const fullMatch = match[0];
+		const classStart = match.index;
+		const openBrace = classStart + fullMatch.lastIndexOf('{');
+
+		let depth = 0;
+		let closeBrace = -1;
+		for (let i = openBrace; i < text.length; i++) {
+			if (text[i] === '{') {
+				depth++;
+			} else if (text[i] === '}') {
+				depth--;
+				if (depth === 0) {
+					closeBrace = i;
+					break;
+				}
+			}
+		}
+
+		if (closeBrace < 0) {
+			continue;
+		}
+
+		if (cursorOffset < classStart || cursorOffset > closeBrace + 1) {
+			continue;
+		}
+
+		const header = text.slice(classStart, openBrace);
+		const bodyText = text.slice(openBrace + 1, closeBrace);
+
+		const extendsMatch = header.match(/\bextends\s+([A-Za-z_]\w*(?:<[^>]+>)?)/);
+		const extendsName = extendsMatch?.[1];
+		const extendsBase = extendsName ? stripTypeArgs(extendsName) : undefined;
+
+		const stateWidgetMatch = extendsName?.match(/^State<\s*([A-Za-z_]\w*)\s*>$/);
+		const stateWidgetType = stateWidgetMatch?.[1];
+
+		const implementsMatch = header.match(/\bimplements\s+([^\{]+)/);
+		const implementsNames = (implementsMatch?.[1] ?? '')
+			.split(',')
+			.map(name => stripTypeArgs(name))
+			.map(name => name.trim())
+			.filter(Boolean);
+
+		const methodNames = new Set<string>();
+		const methodRegex = /(?:@override\s+)?(?:static\s+)?(?:[\w<>,\?\[\]\s\.]+\s+)?([A-Za-z_]\w*)\s*\([^;{}]*\)\s*(?:async\s*)?(?:=>|\{)/g;
+		let methodMatch: RegExpExecArray | null;
+		while ((methodMatch = methodRegex.exec(bodyText)) !== null) {
+			if (methodMatch[1]) {
+				methodNames.add(methodMatch[1]);
+			}
+		}
+
+		const classLineStart = text.lastIndexOf('\n', classStart - 1) + 1;
+		const classIndent = (text.slice(classLineStart, classStart).match(/^[ \t]*/) ?? [''])[0];
+		const indentMatch = bodyText.match(/\n([ \t]+)\S/);
+		const indent = indentMatch?.[1] ?? `${classIndent}  `;
+
+		return {
+			name: className,
+			start: classStart,
+			end: closeBrace + 1,
+			bodyStart: openBrace + 1,
+			bodyEnd: closeBrace,
+			header,
+			extendsName: extendsBase,
+			stateWidgetType,
+			implementsNames,
+			methodNames,
+			indent
+		};
+	}
+
+	return undefined;
+}
+
+function getOverrideCandidates(ctx: DartClassContext): Array<{ name: string; body: string }> {
+	const widgetType = ctx.stateWidgetType ?? 'Widget';
+	const candidates: Array<{ name: string; body: string }> = [];
+	const baseName = ctx.extendsName ?? '';
+
+	const add = (name: string, body: string) => {
+		if (!ctx.methodNames.has(name)) {
+			candidates.push({ name, body });
+		}
+	};
+
+	if (baseName === 'StatelessWidget' || baseName === 'GetView' || baseName === 'GetWidget' || baseName === 'GetResponsiveView') {
+		add('build', `@override\nWidget build(BuildContext context) {\n  return const SizedBox.shrink();\n}`);
+	}
+
+	if (baseName === 'StatefulWidget') {
+		add('createState', `@override\nState<${ctx.name}> createState() => _${ctx.name}State();`);
+	}
+
+	if (baseName === 'State') {
+		add('initState', '@override\nvoid initState() {\n  super.initState();\n}');
+		add('didChangeDependencies', '@override\nvoid didChangeDependencies() {\n  super.didChangeDependencies();\n}');
+		add('didUpdateWidget', `@override\nvoid didUpdateWidget(covariant ${widgetType} oldWidget) {\n  super.didUpdateWidget(oldWidget);\n}`);
+		add('reassemble', '@override\nvoid reassemble() {\n  super.reassemble();\n}');
+		add('deactivate', '@override\nvoid deactivate() {\n  super.deactivate();\n}');
+		add('dispose', '@override\nvoid dispose() {\n  super.dispose();\n}');
+		add('build', `@override\nWidget build(BuildContext context) {\n  return const SizedBox.shrink();\n}`);
+	}
+
+	if (baseName === 'GetxController') {
+		add('onInit', '@override\nvoid onInit() {\n  super.onInit();\n}');
+		add('onReady', '@override\nvoid onReady() {\n  super.onReady();\n}');
+		add('onClose', '@override\nvoid onClose() {\n  super.onClose();\n}');
+	}
+
+	if (baseName === 'ChangeNotifier') {
+		add('dispose', '@override\nvoid dispose() {\n  super.dispose();\n}');
+	}
+
+	if (ctx.implementsNames.includes('WidgetsBindingObserver')) {
+		add('didChangeAppLifecycleState', '@override\nvoid didChangeAppLifecycleState(AppLifecycleState state) {}');
+		add('didHaveMemoryPressure', '@override\nvoid didHaveMemoryPressure() {}');
+	}
+
+	if (ctx.implementsNames.includes('PreferredSizeWidget')) {
+		add('preferredSize', '@override\nSize get preferredSize => const Size.fromHeight(kToolbarHeight);');
+	}
+
+	if (ctx.implementsNames.includes('RouteAware')) {
+		add('didPopNext', '@override\nvoid didPopNext() {}');
+		add('didPush', '@override\nvoid didPush() {}');
+		add('didPop', '@override\nvoid didPop() {}');
+		add('didPushNext', '@override\nvoid didPushNext() {}');
+	}
+
+	if (candidates.length === 0) {
+		add('toString', `@override\nString toString() {\n  return '${ctx.name}()';\n}`);
+		add('operator ==', `@override\nbool operator ==(Object other) {\n  if (identical(this, other)) return true;\n  return other is ${ctx.name};\n}`);
+		add('hashCode', '@override\nint get hashCode => runtimeType.hashCode;');
+	}
+
+	return candidates;
+}
+
+function indentBlock(code: string, indent: string): string {
+	return code
+		.split('\n')
+		.map(line => `${indent}${line}`)
+		.join('\n');
+}
+
 class DartObxWrapCodeActionProvider implements vscode.CodeActionProvider {
 	provideCodeActions(document: vscode.TextDocument, range: vscode.Range): vscode.CodeAction[] {
 		if (document.languageId !== 'dart') {
@@ -237,8 +411,9 @@ class DartObxWrapCodeActionProvider implements vscode.CodeActionProvider {
 		const hasSelection = !range.isEmpty;
 		const canDetectWidget = !!findWidgetOffsets(document.getText(), document.offsetAt(range.start), true);
 		const canDetectFunction = !!findFunctionOffsets(document.getText(), document.offsetAt(range.start));
+		const canDetectClass = !!findCurrentClassContext(document.getText(), document.offsetAt(range.start));
 		// 只有能确定目标时才展示 Rewrite 动作，减少无效噪音。
-		if (!hasSelection && !canDetectWidget && !canDetectFunction) {
+		if (!hasSelection && !canDetectWidget && !canDetectFunction && !canDetectClass) {
 			return [];
 		}
 
@@ -278,15 +453,76 @@ class DartObxWrapCodeActionProvider implements vscode.CodeActionProvider {
 			title: 'Select Current Function'
 		};
 
+		const overrideMethodsAction = new vscode.CodeAction('Generate Override Methods', vscode.CodeActionKind.RefactorRewrite);
+		overrideMethodsAction.command = {
+			command: 'flutterTools.generateOverrideMethods',
+			title: 'Generate Override Methods'
+		};
+
 		return [
 			action,
 			blockAction,
 			futureBuilderAction,
 			layoutBuilderAction,
 			getBuilderAction,
-			selectFunctionAction
+			selectFunctionAction,
+			overrideMethodsAction
 		];
 	}
+}
+
+async function generateOverrideMethodsFunction() {
+	const editor = vscode.window.activeTextEditor;
+	if (!editor) {
+		vscode.window.showInformationMessage('No active editor');
+		return;
+	}
+
+	const document = editor.document;
+	if (document.languageId !== 'dart') {
+		vscode.window.showInformationMessage('Generate Override Methods only supports Dart files.');
+		return;
+	}
+
+	const cursorOffset = document.offsetAt(editor.selection.active);
+	const ctx = findCurrentClassContext(document.getText(), cursorOffset);
+	if (!ctx) {
+		vscode.window.showInformationMessage('No class found at cursor.');
+		return;
+	}
+
+	const candidates = getOverrideCandidates(ctx);
+	if (candidates.length === 0) {
+		vscode.window.showInformationMessage('No override candidates found for current class.');
+		return;
+	}
+
+	const picks = await vscode.window.showQuickPick(
+		candidates.map(item => ({ label: item.name, description: 'override', candidate: item })),
+		{
+			canPickMany: true,
+			placeHolder: 'Select methods to override'
+		}
+	);
+
+	if (!picks || picks.length === 0) {
+		return;
+	}
+
+	const blocks = picks.map(p => indentBlock(p.candidate.body, ctx.indent));
+	const insertionText = `\n\n${blocks.join('\n\n')}\n`;
+	const insertPos = document.positionAt(ctx.bodyEnd);
+
+	const ok = await editor.edit(editBuilder => {
+		editBuilder.insert(insertPos, insertionText);
+	});
+
+	if (!ok) {
+		vscode.window.showErrorMessage('Generate Override Methods failed.');
+		return;
+	}
+
+	vscode.window.showInformationMessage('Override methods generated.');
 }
 
 function selectCurrentFunctionFunction() {

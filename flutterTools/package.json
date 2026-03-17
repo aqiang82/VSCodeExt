@@ -54,6 +54,10 @@
       {
         "command": "flutterTools.selectCurrentFunction",
         "title": "Flutter Tools: Select Current Function"
+      },
+      {
+        "command": "flutterTools.generateOverrideMethods",
+        "title": "Flutter Tools: Generate Override Methods"
       }
     ],
     "menus": {
