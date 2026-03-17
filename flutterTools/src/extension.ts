@@ -168,8 +168,8 @@ function getGetImportInsertPosition(document: vscode.TextDocument): vscode.Posit
 
 function findFunctionOffsets(text: string, cursorOffset: number): FunctionOffsets | undefined {
 	const safeOffset = Math.max(0, Math.min(cursorOffset, text.length));
-	// 匹配 Dart 函数头：支持注解、返回类型、泛型参数、async、块函数/箭头函数。
-	const functionRegex = /(^|\n)\s*(?:@[^\n]+\n\s*)*(?:[A-Za-z_][\w<>,\?\s\[\]\.]*\s+)?([A-Za-z_]\w*)\s*(?:<[^>{}\n]*>)?\s*\([^;{}]*\)\s*(?:async\s*)?(=>|{)/gm;
+	// 匹配 Dart 函数头：支持注解、返回类型、泛型参数、命名参数({})、async、块函数/箭头函数。
+	const functionRegex = /(^|\n)\s*(?:@[^\n]+\n\s*)*(?:[A-Za-z_][\w<>,\?\s\[\]\.]*\s+)?([A-Za-z_]\w*)\s*(?:<[^>{}\n]*>)?\s*\([^;]*\)\s*(?:async\s*)?(=>|{)/gm;
 	const excluded = new Set(['if', 'for', 'while', 'switch', 'catch']);
 
 	let best: FunctionOffsets | undefined;
