@@ -511,7 +511,10 @@ async function generateOverrideMethodsFunction() {
 
 	const blocks = picks.map(p => indentBlock(p.candidate.body, ctx.indent));
 	const insertionText = `\n\n${blocks.join('\n\n')}\n`;
-	const insertPos = document.positionAt(ctx.bodyEnd);
+	const isCursorInsideClassBody = cursorOffset >= ctx.bodyStart && cursorOffset <= ctx.bodyEnd;
+	const insertPos = isCursorInsideClassBody
+		? editor.selection.active
+		: document.positionAt(ctx.bodyEnd);
 
 	const ok = await editor.edit(editBuilder => {
 		editBuilder.insert(insertPos, insertionText);
