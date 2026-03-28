@@ -93,6 +93,11 @@ type DartClassContext = {
 	indent: string;
 };
 
+type GetXGenerationOption = vscode.QuickPickItem & {
+	value?: 'controller' | 'logic' | 'view' | 'widget' | 'page' | 'state' | 'binding';
+	group: 'logic' | 'presentation' | 'optional';
+};
+
 function findWidgetOffsets(text: string, cursorOffset: number, includeTrailingComma: boolean): WidgetOffsets | undefined {
 	const safeOffset = Math.max(0, Math.min(cursorOffset, text.length));
 	const rightChar = safeOffset < text.length ? text[safeOffset] : '';
@@ -135,9 +140,40 @@ function findWidgetOffsets(text: string, cursorOffset: number, includeTrailingCo
 	}
 
 	let start = widgetStartParen;
-	while (start > 0 && /[a-zA-Z0-9_.]/.test(text[start - 1])) {
-		start--;
+	let i = widgetStartParen - 1;
+	while (i >= 0 && /\s/.test(text[i])) {
+		i--;
 	}
+
+	let angleDepth = 0;
+	for (; i >= 0; i--) {
+		const ch = text[i];
+
+		if (ch === '>') {
+			angleDepth++;
+			continue;
+		}
+
+		if (ch === '<') {
+			if (angleDepth > 0) {
+				angleDepth--;
+				continue;
+			}
+			break;
+		}
+
+		if (angleDepth > 0) {
+			continue;
+		}
+
+		if (/[a-zA-Z0-9_.]/.test(ch)) {
+			continue;
+		}
+
+		break;
+	}
+
+	start = i + 1;
 
 	let end = safeOffset;
 	let openParen = 0;
@@ -724,6 +760,93 @@ async function askDeepSeekFunction() {
 	// 	}
 }
 
+async function pickGetXGenerationOptions(): Promise<GetXGenerationOption[] | undefined> {
+	const options: GetXGenerationOption[] = [
+		{ label: '逻辑层', kind: vscode.QuickPickItemKind.Separator, group: 'logic' },
+		{ label: 'Controller', value: 'controller', description: '默认', detail: '生成 xxx_controller.dart', picked: true, group: 'logic' },
+		{ label: 'Logic', value: 'logic', detail: '生成 xxx_logic.dart', group: 'logic' },
+		{ label: '展示层', kind: vscode.QuickPickItemKind.Separator, group: 'presentation' },
+		{ label: 'View', value: 'view', description: '默认', detail: '生成 xxx_view.dart', picked: true, group: 'presentation' },
+		{ label: 'Widget', value: 'widget', detail: '生成 xxx_widget.dart', group: 'presentation' },
+		{ label: 'Page', value: 'page', detail: '生成 xxx_page.dart，带 Scaffold', group: 'presentation' },
+		{ label: '可选文件', kind: vscode.QuickPickItemKind.Separator, group: 'optional' },
+		{ label: 'State', value: 'state', detail: '生成 xxx_state.dart', group: 'optional' },
+		{ label: 'Binding', value: 'binding', detail: '生成 xxx_binding.dart', group: 'optional' }
+	];
+
+	return await new Promise<GetXGenerationOption[] | undefined>(resolve => {
+		const quickPick = vscode.window.createQuickPick<GetXGenerationOption>();
+		quickPick.title = '生成 GetX 模块';
+		quickPick.placeholder = '选择要生成的文件';
+		quickPick.canSelectMany = true;
+		quickPick.items = options;
+
+		const selectableOptions = options.filter(option => option.kind !== vscode.QuickPickItemKind.Separator);
+		const optionByValue = new Map(
+			selectableOptions
+				.filter((option): option is GetXGenerationOption & { value: NonNullable<GetXGenerationOption['value']> } => !!option.value)
+				.map(option => [option.value, option])
+		);
+		let currentSelectedItems = selectableOptions.filter(option => option.picked);
+		let isUpdatingSelection = false;
+		let didAccept = false;
+		let isResolved = false;
+
+		quickPick.selectedItems = currentSelectedItems;
+
+		const disposeAndResolve = (value: GetXGenerationOption[] | undefined) => {
+			if (isResolved) {
+				return;
+			}
+			isResolved = true;
+			quickPick.dispose();
+			resolve(value);
+		};
+
+		quickPick.onDidChangeSelection(items => {
+			if (isUpdatingSelection) {
+				return;
+			}
+
+			const addedItems = items.filter(item => !currentSelectedItems.some(selected => selected.value === item.value));
+			const nextSelection = [...items];
+
+			for (const addedItem of addedItems) {
+				if (addedItem.group === 'optional') {
+					continue;
+				}
+
+				for (let index = nextSelection.length - 1; index >= 0; index--) {
+					const candidate = nextSelection[index];
+					if (candidate.group === addedItem.group && candidate.value !== addedItem.value) {
+						nextSelection.splice(index, 1);
+					}
+				}
+			}
+
+			const hasChanged = nextSelection.length !== items.length || nextSelection.some((item, index) => item.value !== items[index]?.value);
+			currentSelectedItems = nextSelection;
+
+			if (hasChanged) {
+				isUpdatingSelection = true;
+				quickPick.selectedItems = nextSelection.map(item => item.value ? (optionByValue.get(item.value) ?? item) : item);
+				isUpdatingSelection = false;
+			}
+		});
+
+		quickPick.onDidAccept(() => {
+			didAccept = true;
+			disposeAndResolve([...quickPick.selectedItems]);
+		});
+		quickPick.onDidHide(() => {
+			if (!didAccept) {
+				disposeAndResolve(undefined);
+			}
+		});
+		quickPick.show();
+	});
+}
+
 // 生成 GetX 模块
 async function generateGetXModule(uri?: vscode.Uri) {
 	if (!uri) {
@@ -757,16 +880,32 @@ async function generateGetXModule(uri?: vscode.Uri) {
 		placeHolder: 'e.g. user_profile or userProfile',
 	});
 	if (!moduleNameInput) {
-		vscode.window.showErrorMessage('Module name is required');
 		return;
 	}
 
-	const generateBinding = await vscode.window.showQuickPick(['Yes', 'No'], {
-		placeHolder: 'Generate Binding file?',
-	});
-	const generateState = await vscode.window.showQuickPick(['Yes', 'No'], {
-		placeHolder: 'Generate State file?',
-	});
+	const generationSelections = await pickGetXGenerationOptions();
+
+	if (!generationSelections) {
+		// Esc/cancel: do nothing and never create files.
+		return;
+	}
+
+	const selectedTypes = new Set(generationSelections.flatMap(item => item.value ? [item.value] : []));
+	const selectedLogicTypes = generationSelections.filter(item => item.group === 'logic' && item.value);
+	const selectedPresentationTypes = generationSelections.filter(item => item.group === 'presentation' && item.value);
+
+	if (selectedLogicTypes.length !== 1) {
+		vscode.window.showInformationMessage('请选择且仅选择一个逻辑层类型：controller 或 logic。');
+		return;
+	}
+
+	if (selectedPresentationTypes.length !== 1) {
+		vscode.window.showInformationMessage('请选择且仅选择一个展示层类型：view、widget 或 page。');
+		return;
+	}
+
+	const logicType = selectedLogicTypes[0];
+	const presentationType = selectedPresentationTypes[0];
 
 	const snakeName = toSnakeCase(moduleNameInput); // 转下划线
 	const pascalName = toPascalCase(moduleNameInput); // 转驼峰
@@ -798,47 +937,58 @@ async function generateGetXModule(uri?: vscode.Uri) {
 		fs.mkdirSync(moduleDir, { recursive: true });
 	}
 
+	const shouldGenerateState = selectedTypes.has('state');
+	const shouldGenerateBinding = selectedTypes.has('binding');
+	const logicValue = logicType.value ?? 'controller';
+	const presentationValue = presentationType.value ?? 'view';
+	const logicFileSuffix = logicValue;
+	const logicClassSuffix = logicValue === 'logic' ? 'Logic' : 'Controller';
+	const logicFileName = `${snakeName}_${logicFileSuffix}.dart`;
+	const logicClassName = `${pascalName}${logicClassSuffix}`;
+	const presentationFileSuffix = presentationValue;
+	const presentationClassSuffix = toPascalCase(presentationValue);
+	const presentationFileName = `${snakeName}_${presentationFileSuffix}.dart`;
+	const presentationClassName = `${pascalName}${presentationClassSuffix}`;
+	const widgetBaseClass = presentationValue === 'widget' ? 'GetWidget' : 'GetView';
+
 	// 各文件内容模版
-	const stateFile =  generateState === 'Yes' ? `import '${snakeName}_state.dart';` : '';
-	const initState =  generateState === 'Yes' ? `final state = ${pascalName}State();` : '';
+	const stateFile = shouldGenerateState ? `import '${snakeName}_state.dart';` : '';
+	const initState = shouldGenerateState ? `final state = ${pascalName}State();` : '';
 	const controllerContent = `import 'package:get/get.dart';
 ${stateFile}
-class ${pascalName}Controller extends GetxController {
-  //TODO: Implement Controller
+class ${logicClassName} extends GetxController {
+  // TODO: Implement ${logicClassSuffix}
   ${initState}
 }
 `;
 	
-	const getState = generateState === 'Yes' ? `${pascalName}State get state => controller.state;` : '';
-	const initView = `const ${pascalName}View({super.key});`;
+	const getState = shouldGenerateState ? `${pascalName}State get state => controller.state;` : '';
+	const initPresentation = `const ${presentationClassName}({super.key});`;
+	const bodyContent = presentationValue === 'page'
+		? `return Scaffold(\n      appBar: AppBar(\n        title: Text('${pascalName}'),\n        centerTitle: true,\n      ),\n      body: Container(),\n    );`
+		: 'return Container();';
 	const viewContent = `import 'package:flutter/material.dart';
 import 'package:get/get.dart';
-import '${snakeName}_controller.dart';
+import '${logicFileName}';
 ${stateFile}
 
-class ${pascalName}View extends GetView<${pascalName}Controller> {
-	${initView}
+class ${presentationClassName} extends ${widgetBaseClass}<${logicClassName}> {
+	${initPresentation}
    ${getState}
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: Text('${pascalName}'),
-        centerTitle: true,
-      ),
-      body: Container(),
-    );
+	    ${bodyContent}
   }
 }
 `;
 
 	const bindingContent = `import 'package:get/get.dart';
-import '${snakeName}_controller.dart';
+import '${logicFileName}';
 
 class ${pascalName}Binding extends Bindings {
   @override
   void dependencies() {
-    Get.lazyPut<${pascalName}Controller>(() => ${pascalName}Controller());
+	    Get.lazyPut<${logicClassName}>(() => ${logicClassName}());
   }
 }
 `;
@@ -870,14 +1020,14 @@ class ${pascalName}Binding extends Bindings {
 	}
 
 	// 生成必须文件
-	writeFile(`${snakeName}_controller.dart`, controllerContent);
-	writeFile(`${snakeName}_view.dart`, viewContent);
+	writeFile(logicFileName, controllerContent);
+	writeFile(presentationFileName, viewContent);
 
 	// 生成可选文件
-	if (generateBinding === 'Yes') {
+	if (shouldGenerateBinding) {
 		writeFile(`${snakeName}_binding.dart`, bindingContent);
 	}
-	if (generateState === 'Yes') {
+	if (shouldGenerateState) {
 		writeFile(`${snakeName}_state.dart`, stateContent);
 	}
 }
