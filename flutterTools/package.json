@@ -2,7 +2,7 @@
   "name": "flutter-tools",
   "displayName": "flutterTools",
   "description": "flutter tools",
-  "version": "0.0.11",
+  "version": "0.0.12",
   "engines": {
     "vscode": "^1.101.0"
   },
@@ -10,7 +10,7 @@
     "Other"
   ],
   "activationEvents": [
-    "onLanguage:dart"
+  "onLanguage:dart"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -58,6 +58,10 @@
       {
         "command": "flutterTools.generateOverrideMethods",
         "title": "Flutter Tools: Generate Override Methods"
+	  },
+	  {
+		"command": "flutterTools.renameFileToSnakeCase",
+		"title": "Flutter Tools: Rename File to snake_case"
       }
     ],
     "menus": {
@@ -66,6 +70,16 @@
           "command": "flutterTools.generateGetXModule",
           "when": "explorerResourceIsFolder",
           "group": "navigation"
+		},
+		{
+		  "command": "flutterTools.renameFileToSnakeCase",
+      "when": "explorerResourceIsFolder",
+      "group": "navigation"
+    },
+    {
+      "command": "flutterTools.renameFileToSnakeCase",
+      "when": "!explorerResourceIsFolder && resourceScheme == file",
+		  "group": "navigation"
         }
       ]
     },

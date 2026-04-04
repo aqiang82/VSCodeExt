@@ -56,6 +56,10 @@ export function activate(context: vscode.ExtensionContext) {
 	);
 
 	context.subscriptions.push(
+		vscode.commands.registerCommand('flutterTools.renameFileToSnakeCase', renameFileToSnakeCaseFunction)
+	);
+
+	context.subscriptions.push(
 		vscode.languages.registerCodeActionsProvider(
 			{ language: 'dart', scheme: 'file' },
 			new DartObxWrapCodeActionProvider(),
@@ -97,6 +101,16 @@ type GetXGenerationOption = vscode.QuickPickItem & {
 	value?: 'controller' | 'logic' | 'view' | 'widget' | 'page' | 'state' | 'binding';
 	group: 'logic' | 'presentation' | 'optional';
 };
+
+function toSnakeCaseText(value: string): string {
+	return value
+		.replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2')
+		.replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+		.replace(/[\s-]+/g, '_')
+		.replace(/_+/g, '_')
+		.replace(/^_+|_+$/g, '')
+		.toLowerCase();
+}
 
 function findWidgetOffsets(text: string, cursorOffset: number, includeTrailingComma: boolean): WidgetOffsets | undefined {
 	const safeOffset = Math.max(0, Math.min(cursorOffset, text.length));
@@ -847,6 +861,59 @@ async function pickGetXGenerationOptions(): Promise<GetXGenerationOption[] | und
 	});
 }
 
+async function renameFileToSnakeCaseFunction(uri?: vscode.Uri) {
+	if (!uri) {
+		vscode.window.showErrorMessage('请在文件或文件夹上右键后使用该命令。');
+		return;
+	}
+
+	const filePath = uri.fsPath;
+	let fileStat: vscode.FileStat | undefined;
+	try {
+		fileStat = await vscode.workspace.fs.stat(uri);
+	} catch {
+		fileStat = undefined;
+	}
+
+	if (!fileStat || (fileStat.type !== vscode.FileType.File && fileStat.type !== vscode.FileType.Directory)) {
+		vscode.window.showInformationMessage('该命令仅支持文件或文件夹。');
+		return;
+	}
+
+	const isDirectory = fileStat.type === vscode.FileType.Directory;
+	const currentName = isDirectory ? path.basename(filePath) : path.parse(filePath).name;
+	const extension = isDirectory ? '' : path.extname(filePath);
+	const parentDir = path.dirname(filePath);
+	const nextBaseName = toSnakeCaseText(currentName);
+	if (!nextBaseName) {
+		vscode.window.showInformationMessage('无法生成有效的新名称。');
+		return;
+	}
+
+	if (nextBaseName === currentName) {
+		vscode.window.showInformationMessage(isDirectory ? '文件夹名已经是下划线小写格式。' : '文件名已经是下划线小写格式。');
+		return;
+	}
+
+	const targetPath = path.join(parentDir, `${nextBaseName}${extension}`);
+	const targetUri = vscode.Uri.file(targetPath);
+	let targetExists = false;
+	try {
+		await vscode.workspace.fs.stat(targetUri);
+		targetExists = true;
+	} catch {
+		targetExists = false;
+	}
+
+	if (targetExists) {
+		vscode.window.showErrorMessage(`目标已存在：${nextBaseName}${extension}`);
+		return;
+	}
+
+	await vscode.workspace.fs.rename(uri, targetUri);
+	vscode.window.showInformationMessage(`已重命名为：${nextBaseName}${extension}`);
+}
+
 // 生成 GetX 模块
 async function generateGetXModule(uri?: vscode.Uri) {
 	if (!uri) {
@@ -854,10 +921,7 @@ async function generateGetXModule(uri?: vscode.Uri) {
 		return;
 	}
 	function toSnakeCase(str: string): string {
-		return str
-			.replace(/([A-Z])/g, "_$1") // 大写前加下划线
-			.toLowerCase()
-			.replace(/^_/, ""); // 如果开头有下划线，去掉
+		return toSnakeCaseText(str);
 	}
 
 	function toPascalCase(str: string): string {
