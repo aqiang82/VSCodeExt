@@ -5,7 +5,10 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { extractWidgetToFile } from './generators/extract_widget_to_file';
 
+let extensionContextRef: vscode.ExtensionContext | undefined;
+
 export function activate(context: vscode.ExtensionContext) {
+	extensionContextRef = context;
 	console.log('flutterTools is now active!');
 
 	// 命令: 选择当前 widget
@@ -60,6 +63,18 @@ export function activate(context: vscode.ExtensionContext) {
 	);
 
 	context.subscriptions.push(
+		vscode.commands.registerCommand('flutterTools.searchFiles', searchProjectFilesFunction)
+	);
+
+	context.subscriptions.push(
+		vscode.window.onDidChangeActiveTextEditor(editor => {
+			if (editor) {
+				rememberRecentSearchFile(editor.document.uri);
+			}
+		})
+	);
+
+	context.subscriptions.push(
 		vscode.languages.registerCodeActionsProvider(
 			{ language: 'dart', scheme: 'file' },
 			new DartObxWrapCodeActionProvider(),
@@ -101,6 +116,393 @@ type GetXGenerationOption = vscode.QuickPickItem & {
 	value?: 'controller' | 'logic' | 'view' | 'widget' | 'page' | 'state' | 'binding';
 	group: 'logic' | 'presentation' | 'optional';
 };
+
+type QuickPickHighlightRanges = {
+	label?: Array<[number, number]>;
+	description?: Array<[number, number]>;
+	detail?: Array<[number, number]>;
+};
+
+type WorkspaceFileQuickPickItem = vscode.QuickPickItem & {
+	uri: vscode.Uri;
+	highlights?: QuickPickHighlightRanges;
+};
+
+const recentSearchFilesStorageKey = 'flutterTools.searchFiles.recentFiles';
+const maxRecentSearchFiles = 100;
+const maxSearchResultFiles = 200;
+const flutterSearchExcludeGlob = '**/{.git,.svn,.hg,.dart_tool,.fvm,.idea,.gradle,build,dist,node_modules,Pods,.symlinks,.plugin_symlinks}/**';
+const excludedSearchPathSegments = new Set([
+	'.git',
+	'.svn',
+	'.hg',
+	'.dart_tool',
+	'.fvm',
+	'.idea',
+	'.gradle',
+	'build',
+	'dist',
+	'node_modules',
+	'Pods',
+	'.symlinks',
+	'.plugin_symlinks'
+]);
+
+function getRememberedSearchValue(storageKey: string): string {
+	return extensionContextRef?.workspaceState.get<string>(storageKey) ?? '';
+}
+
+function setRememberedSearchValue(storageKey: string, value: string): void {
+	void extensionContextRef?.workspaceState.update(storageKey, value);
+}
+
+function shouldExcludeFromFileSearch(uri: vscode.Uri): boolean {
+	if (uri.scheme !== 'file') {
+		return true;
+	}
+
+	const workspaceFolder = vscode.workspace.getWorkspaceFolder(uri);
+	if (!workspaceFolder) {
+		return true;
+	}
+
+	const relativePath = vscode.workspace.asRelativePath(uri, false);
+	const pathSegments = relativePath.split('/');
+	return pathSegments.some(segment => excludedSearchPathSegments.has(segment));
+}
+
+function rememberRecentSearchFile(uri: vscode.Uri): void {
+	if (uri.scheme !== 'file') {
+		return;
+	}
+
+	if (!vscode.workspace.getWorkspaceFolder(uri)) {
+		return;
+	}
+
+	if (shouldExcludeFromFileSearch(uri)) {
+		return;
+	}
+
+	const currentItems = extensionContextRef?.workspaceState.get<string[]>(recentSearchFilesStorageKey) ?? [];
+	const nextItems = [uri.fsPath, ...currentItems.filter(item => item !== uri.fsPath)].slice(0, maxRecentSearchFiles);
+	void extensionContextRef?.workspaceState.update(recentSearchFilesStorageKey, nextItems);
+}
+
+function addHighlightRanges(target: Array<[number, number]>, text: string, terms: string[]): void {
+	const lowerText = text.toLowerCase();
+	for (const rawTerm of terms) {
+		const term = rawTerm.toLowerCase();
+		if (!term) {
+			continue;
+		}
+
+		let searchStart = 0;
+		while (searchStart < lowerText.length) {
+			const index = lowerText.indexOf(term, searchStart);
+			if (index < 0) {
+				break;
+			}
+
+			target.push([index, index + term.length]);
+			searchStart = index + term.length;
+		}
+	}
+}
+
+function mergeHighlightRanges(ranges: Array<[number, number]>): Array<[number, number]> {
+	if (ranges.length === 0) {
+		return [];
+	}
+
+	const sortedRanges = [...ranges].sort((left, right) => left[0] - right[0] || left[1] - right[1]);
+	const mergedRanges: Array<[number, number]> = [sortedRanges[0]];
+
+	for (let index = 1; index < sortedRanges.length; index++) {
+		const currentRange = sortedRanges[index];
+		const previousRange = mergedRanges[mergedRanges.length - 1];
+		if (currentRange[0] <= previousRange[1]) {
+			previousRange[1] = Math.max(previousRange[1], currentRange[1]);
+			continue;
+		}
+
+		mergedRanges.push(currentRange);
+	}
+
+	return mergedRanges;
+}
+
+function getWorkspaceFileQueryTermGroups(query: string): string[][] {
+	return getWorkspaceFileQuerySegments(query).map(segment => segment.split(/\s+/).filter(Boolean));
+}
+
+function getWorkspaceFileQueryMatches(relativePath: string, query: string): Array<{ pathSegmentIndex: number; terms: string[] }> | undefined {
+	const normalizedQuery = normalizeWorkspaceFileSearchQuery(query).toLowerCase();
+	if (normalizedQuery === '') {
+		return [];
+	}
+
+	const querySegments = getWorkspaceFileQueryTermGroups(normalizedQuery);
+	const pathSegments = relativePath
+		.replace(/\\/g, '/')
+		.toLowerCase()
+		.split('/')
+		.filter(Boolean);
+
+	let startIndex = 0;
+	const matches: Array<{ pathSegmentIndex: number; terms: string[] }> = [];
+	for (const querySegmentTerms of querySegments) {
+		let matched = false;
+
+		for (let index = startIndex; index < pathSegments.length; index++) {
+			const pathSegment = pathSegments[index];
+			if (querySegmentTerms.every(term => pathSegment.includes(term))) {
+				matches.push({ pathSegmentIndex: index, terms: querySegmentTerms });
+				matched = true;
+				startIndex = index + 1;
+				break;
+			}
+		}
+
+		if (!matched) {
+			return undefined;
+		}
+	}
+
+	return matches;
+}
+
+function getWorkspaceFileQuickPickHighlights(relativePath: string, query: string): QuickPickHighlightRanges | undefined {
+	const matches = getWorkspaceFileQueryMatches(relativePath, query);
+	if (!matches || matches.length === 0) {
+		return undefined;
+	}
+
+	const originalPathSegments = relativePath.replace(/\\/g, '/').split('/').filter(Boolean);
+	const fileName = originalPathSegments[originalPathSegments.length - 1] ?? '';
+	const directorySegments = originalPathSegments.slice(0, -1);
+	const labelRanges: Array<[number, number]> = [];
+	const descriptionRanges: Array<[number, number]> = [];
+
+	for (const match of matches) {
+		if (match.pathSegmentIndex === originalPathSegments.length - 1) {
+			addHighlightRanges(labelRanges, fileName, match.terms);
+			continue;
+		}
+
+		if (match.pathSegmentIndex >= directorySegments.length) {
+			continue;
+		}
+
+		const segmentText = directorySegments[match.pathSegmentIndex];
+		const segmentOffset = directorySegments
+			.slice(0, match.pathSegmentIndex)
+			.reduce((total, segment) => total + segment.length + 1, 0);
+		const segmentRanges: Array<[number, number]> = [];
+		addHighlightRanges(segmentRanges, segmentText, match.terms);
+		for (const [start, end] of segmentRanges) {
+			descriptionRanges.push([segmentOffset + start, segmentOffset + end]);
+		}
+	}
+
+	const label = mergeHighlightRanges(labelRanges);
+	const description = mergeHighlightRanges(descriptionRanges);
+	if (label.length === 0 && description.length === 0) {
+		return undefined;
+	}
+
+	return {
+		label: label.length > 0 ? label : undefined,
+		description: description.length > 0 ? description : undefined
+	};
+}
+
+function getMatchedPathDisplay(relativePath: string, query: string): string | undefined {
+	const matches = getWorkspaceFileQueryMatches(relativePath, query);
+	if (!matches || matches.length === 0) {
+		return undefined;
+	}
+
+	const originalPathSegments = relativePath.replace(/\\/g, '/').split('/').filter(Boolean);
+	const matchedSegments = matches
+		.map(match => originalPathSegments[match.pathSegmentIndex])
+		.filter((segment): segment is string => !!segment);
+
+	if (matchedSegments.length <= 1) {
+		return undefined;
+	}
+
+	return matchedSegments.join('/');
+}
+
+function toWorkspaceFileQuickPickItem(uri: vscode.Uri, query = ''): WorkspaceFileQuickPickItem | undefined {
+	if (shouldExcludeFromFileSearch(uri)) {
+		return undefined;
+	}
+
+	const workspaceFolder = vscode.workspace.getWorkspaceFolder(uri);
+	if (!workspaceFolder) {
+		return undefined;
+	}
+
+	const relativePath = vscode.workspace.asRelativePath(uri, false);
+	const parsedPath = path.parse(relativePath);
+	const matchedPathDisplay = getMatchedPathDisplay(relativePath, query);
+
+	return {
+		label: parsedPath.base,
+		description: matchedPathDisplay ?? relativePath,
+		detail: matchedPathDisplay ? `${workspaceFolder.name} • ${relativePath}` : workspaceFolder.name,
+		highlights: getWorkspaceFileQuickPickHighlights(relativePath, query),
+		alwaysShow: true,
+		uri
+	};
+}
+
+async function getRecentWorkspaceFileSearchItems(): Promise<WorkspaceFileQuickPickItem[]> {
+	const recentPaths = extensionContextRef?.workspaceState.get<string[]>(recentSearchFilesStorageKey) ?? [];
+	const items = await Promise.all(recentPaths.map(async filePath => {
+		const uri = vscode.Uri.file(filePath);
+		try {
+			await vscode.workspace.fs.stat(uri);
+			return toWorkspaceFileQuickPickItem(uri);
+		} catch {
+			return undefined;
+		}
+	}));
+
+	return items.filter((item): item is WorkspaceFileQuickPickItem => !!item);
+}
+
+function normalizeWorkspaceFileSearchQuery(query: string): string {
+	return query.trim().replace(/\\/g, '/').replace(/\/+/g, '/').replace(/^\/+|\/+$/g, '');
+}
+
+function getWorkspaceFileQuerySegments(query: string): string[] {
+	return normalizeWorkspaceFileSearchQuery(query)
+		.split('/')
+		.map(segment => segment.trim())
+		.filter(Boolean);
+}
+
+function buildWorkspaceFileSearchGlob(query: string): string {
+	const segments = getWorkspaceFileQuerySegments(query);
+	if (segments.length === 0) {
+		return '**/*';
+	}
+
+	const lastSegment = segments[segments.length - 1];
+	const lastSegmentPattern = lastSegment.split(/\s+/).filter(Boolean).join('*');
+	if (lastSegmentPattern === '') {
+		return '**/*';
+	}
+
+	return `**/*${lastSegmentPattern}*`;
+}
+
+async function searchWorkspaceFilesByQuery(query: string): Promise<WorkspaceFileQuickPickItem[]> {
+	const fileUris = await vscode.workspace.findFiles(buildWorkspaceFileSearchGlob(query), flutterSearchExcludeGlob, maxSearchResultFiles);
+	const items = fileUris
+		.map(uri => {
+			const relativePath = vscode.workspace.asRelativePath(uri, false);
+			return getWorkspaceFileQueryMatches(relativePath, query) ? uri : undefined;
+		})
+		.filter((uri): uri is vscode.Uri => !!uri)
+		.map(uri => toWorkspaceFileQuickPickItem(uri, query))
+		.filter((item): item is WorkspaceFileQuickPickItem => !!item);
+
+	return items.sort((left, right) => left.label.localeCompare(right.label) || (left.description ?? '').localeCompare(right.description ?? ''));
+}
+
+async function searchProjectFilesFunction() {
+	if (!vscode.workspace.workspaceFolders || vscode.workspace.workspaceFolders.length === 0) {
+		vscode.window.showErrorMessage('Open a workspace folder first.');
+		return;
+	}
+
+	const storageKey = 'flutterTools.searchFiles.lastQuery';
+	const recentItems = await getRecentWorkspaceFileSearchItems();
+
+	const selectedItem = await new Promise<WorkspaceFileQuickPickItem | undefined>(resolve => {
+		const quickPick = vscode.window.createQuickPick<WorkspaceFileQuickPickItem>();
+		quickPick.title = 'Flutter Tools Search Files';
+		quickPick.placeholder = '搜索项目文件，空输入时显示最近打开文件';
+		quickPick.matchOnDescription = true;
+		quickPick.matchOnDetail = true;
+		quickPick.items = recentItems;
+		quickPick.value = getRememberedSearchValue(storageKey);
+
+		let searchTimer: NodeJS.Timeout | undefined;
+		let activeSearchId = 0;
+
+		const updateItems = async (value: string) => {
+			const query = value.trim();
+			if (query === '') {
+				quickPick.busy = false;
+				quickPick.items = recentItems;
+				return;
+			}
+
+			const searchId = ++activeSearchId;
+			quickPick.busy = true;
+			const foundItems = await searchWorkspaceFilesByQuery(query);
+			if (searchId !== activeSearchId) {
+				return;
+			}
+
+			quickPick.busy = false;
+			quickPick.items = foundItems;
+		};
+
+		// 保留上一次输入的查询内容，下次打开时直接恢复。
+		quickPick.onDidChangeValue(value => {
+			setRememberedSearchValue(storageKey, value);
+			if (searchTimer) {
+				clearTimeout(searchTimer);
+			}
+			searchTimer = setTimeout(() => {
+				void updateItems(value);
+			}, 120);
+		});
+
+		let resolved = false;
+		const finish = (item: WorkspaceFileQuickPickItem | undefined) => {
+			if (resolved) {
+				return;
+			}
+			resolved = true;
+			if (searchTimer) {
+				clearTimeout(searchTimer);
+			}
+			setRememberedSearchValue(storageKey, quickPick.value);
+			quickPick.dispose();
+			resolve(item);
+		};
+
+		quickPick.onDidAccept(() => {
+			finish(quickPick.selectedItems[0]);
+		});
+
+		quickPick.onDidHide(() => {
+			finish(undefined);
+		});
+
+		quickPick.show();
+		void updateItems(quickPick.value);
+	});
+
+	if (!selectedItem) {
+		return;
+	}
+
+	try {
+		await vscode.commands.executeCommand('vscode.open', selectedItem.uri);
+		rememberRecentSearchFile(selectedItem.uri);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : 'Unknown error';
+		vscode.window.showErrorMessage(`Open file failed: ${message}`);
+	}
+}
 
 function toSnakeCaseText(value: string): string {
 	return value
