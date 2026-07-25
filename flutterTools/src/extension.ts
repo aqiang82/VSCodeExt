@@ -4,6 +4,11 @@ import { callDeepSeek } from './deepseek/deepseek';
 import * as fs from 'fs';
 import * as path from 'path';
 import { extractWidgetToFile } from './generators/extract_widget_to_file';
+import { findFunctionOffsets } from './dart_function_parser';
+import {
+	findWidgetUnwrapEdit,
+	RemovableWidgetWrapper
+} from './dart_widget_unwrapper';
 
 let extensionContextRef: vscode.ExtensionContext | undefined;
 
@@ -51,6 +56,14 @@ export function activate(context: vscode.ExtensionContext) {
 	);
 
 	context.subscriptions.push(
+		vscode.commands.registerCommand('flutterTools.removeObxParent', removeObxParentFunction)
+	);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand('flutterTools.removeGetBuilderParent', removeGetBuilderParentFunction)
+	);
+
+	context.subscriptions.push(
 		vscode.commands.registerCommand('flutterTools.selectCurrentFunction', selectCurrentFunctionFunction)
 	);
 
@@ -89,11 +102,6 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 type WidgetOffsets = {
-	start: number;
-	end: number;
-};
-
-type FunctionOffsets = {
 	start: number;
 	end: number;
 };
@@ -636,68 +644,6 @@ function getGetImportInsertPosition(document: vscode.TextDocument): vscode.Posit
 	return new vscode.Position(0, 0);
 }
 
-function findFunctionOffsets(text: string, cursorOffset: number): FunctionOffsets | undefined {
-	const safeOffset = Math.max(0, Math.min(cursorOffset, text.length));
-	// 匹配 Dart 函数头：支持注解、返回类型、泛型参数、命名参数({})、async、块函数/箭头函数。
-	const functionRegex = /(^|\n)\s*(?:@[^\n]+\n\s*)*(?:[A-Za-z_][\w<>,\?\s\[\]\.]*\s+)?([A-Za-z_]\w*)\s*(?:<[^>{}\n]*>)?\s*\([^;]*\)\s*(?:async\s*)?(=>|{)/gm;
-	const excluded = new Set(['if', 'for', 'while', 'switch', 'catch']);
-
-	let best: FunctionOffsets | undefined;
-	let match: RegExpExecArray | null;
-
-	while ((match = functionRegex.exec(text)) !== null) {
-		const leading = match[1] ?? '';
-		const name = match[2];
-		if (!name || excluded.has(name)) {
-			continue;
-		}
-
-		const start = match.index + leading.length;
-		const matchText = match[0].slice(leading.length);
-		const isArrow = match[3] === '=>';
-
-		let end = -1;
-		if (isArrow) {
-			// 箭头函数以分号结尾，选中到 ;
-			const arrowIndex = start + matchText.lastIndexOf('=>');
-			const semicolonIndex = text.indexOf(';', arrowIndex + 2);
-			if (semicolonIndex < 0) {
-				continue;
-			}
-			end = semicolonIndex + 1;
-		} else {
-			// 块函数按大括号深度配对，选中到对应 }
-			const braceOpenIndex = start + matchText.lastIndexOf('{');
-			let depth = 0;
-			for (let i = braceOpenIndex; i < text.length; i++) {
-				if (text[i] === '{') {
-					depth++;
-				} else if (text[i] === '}') {
-					depth--;
-					if (depth === 0) {
-						end = i + 1;
-						break;
-					}
-				}
-			}
-			if (end < 0) {
-				continue;
-			}
-		}
-
-		if (safeOffset < start || safeOffset > end) {
-			continue;
-		}
-
-		// 光标命中多个函数时，优先最小包围范围（通常是最内层函数）
-		if (!best || (end - start) < (best.end - best.start)) {
-			best = { start, end };
-		}
-	}
-
-	return best;
-}
-
 function stripTypeArgs(typeName: string): string {
 	return typeName.replace(/<[^>]*>/g, '').trim();
 }
@@ -864,8 +810,29 @@ class DartObxWrapCodeActionProvider implements vscode.CodeActionProvider {
 		const canDetectWidget = !!findWidgetOffsets(document.getText(), document.offsetAt(range.start), true);
 		const canDetectFunction = !!findFunctionOffsets(document.getText(), document.offsetAt(range.start));
 		const canDetectClass = !!findCurrentClassContext(document.getText(), document.offsetAt(range.start));
+		const selectionStart = document.offsetAt(range.start);
+		const selectionEnd = document.offsetAt(range.end);
+		const canRemoveObx = !!findWidgetUnwrapEdit(
+			document.getText(),
+			selectionStart,
+			selectionEnd,
+			'Obx'
+		);
+		const canRemoveGetBuilder = !!findWidgetUnwrapEdit(
+			document.getText(),
+			selectionStart,
+			selectionEnd,
+			'GetBuilder'
+		);
 		// 只有能确定目标时才展示 Rewrite 动作，减少无效噪音。
-		if (!hasSelection && !canDetectWidget && !canDetectFunction && !canDetectClass) {
+		if (
+			!hasSelection &&
+			!canDetectWidget &&
+			!canDetectFunction &&
+			!canDetectClass &&
+			!canRemoveObx &&
+			!canRemoveGetBuilder
+		) {
 			return [];
 		}
 
@@ -899,6 +866,30 @@ class DartObxWrapCodeActionProvider implements vscode.CodeActionProvider {
 			title: 'Wrap with GetBuilder'
 		};
 
+		const removeActions: vscode.CodeAction[] = [];
+		if (canRemoveObx) {
+			const removeObxAction = new vscode.CodeAction(
+				'Remove Obx Parent',
+				vscode.CodeActionKind.RefactorRewrite
+			);
+			removeObxAction.command = {
+				command: 'flutterTools.removeObxParent',
+				title: 'Remove Obx Parent'
+			};
+			removeActions.push(removeObxAction);
+		}
+		if (canRemoveGetBuilder) {
+			const removeGetBuilderAction = new vscode.CodeAction(
+				'Remove GetBuilder Parent',
+				vscode.CodeActionKind.RefactorRewrite
+			);
+			removeGetBuilderAction.command = {
+				command: 'flutterTools.removeGetBuilderParent',
+				title: 'Remove GetBuilder Parent'
+			};
+			removeActions.push(removeGetBuilderAction);
+		}
+
 		const selectFunctionAction = new vscode.CodeAction('Select Current Function', vscode.CodeActionKind.RefactorRewrite);
 		selectFunctionAction.command = {
 			command: 'flutterTools.selectCurrentFunction',
@@ -917,6 +908,7 @@ class DartObxWrapCodeActionProvider implements vscode.CodeActionProvider {
 			futureBuilderAction,
 			layoutBuilderAction,
 			getBuilderAction,
+			...removeActions,
 			selectFunctionAction,
 			overrideMethodsAction
 		];
@@ -1032,6 +1024,55 @@ async function wrapWithGetBuilderFunction() {
 		successMessage: 'Wrapped with GetBuilder.',
 		requireGetImport: true
 	});
+}
+
+async function removeObxParentFunction() {
+	await removeWidgetParent('Obx');
+}
+
+async function removeGetBuilderParentFunction() {
+	await removeWidgetParent('GetBuilder');
+}
+
+async function removeWidgetParent(wrapper: RemovableWidgetWrapper) {
+	const editor = vscode.window.activeTextEditor;
+	if (!editor) {
+		vscode.window.showInformationMessage('No active editor');
+		return;
+	}
+
+	const document = editor.document;
+	if (document.languageId !== 'dart') {
+		vscode.window.showInformationMessage('Remove parent only supports Dart files.');
+		return;
+	}
+
+	const selectionStart = document.offsetAt(editor.selection.start);
+	const selectionEnd = document.offsetAt(editor.selection.end);
+	const unwrapEdit = findWidgetUnwrapEdit(
+		document.getText(),
+		selectionStart,
+		selectionEnd,
+		wrapper
+	);
+	if (!unwrapEdit) {
+		vscode.window.showInformationMessage(`No removable ${wrapper} parent found at cursor.`);
+		return;
+	}
+
+	const targetRange = new vscode.Range(
+		document.positionAt(unwrapEdit.start),
+		document.positionAt(unwrapEdit.end)
+	);
+	const ok = await editor.edit(editBuilder => {
+		editBuilder.replace(targetRange, unwrapEdit.replacement);
+	});
+	if (!ok) {
+		vscode.window.showErrorMessage(`Remove ${wrapper} parent failed.`);
+		return;
+	}
+
+	vscode.window.showInformationMessage(`${wrapper} parent removed.`);
 }
 
 function splitTrailingComma(text: string): { body: string; hasTrailingComma: boolean } {

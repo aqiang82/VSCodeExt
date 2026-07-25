@@ -52,6 +52,14 @@
         "title": "Flutter Tools: Wrap with GetBuilder"
       },
       {
+        "command": "flutterTools.removeObxParent",
+        "title": "Flutter Tools: Remove Obx Parent"
+      },
+      {
+        "command": "flutterTools.removeGetBuilderParent",
+        "title": "Flutter Tools: Remove GetBuilder Parent"
+      },
+      {
         "command": "flutterTools.selectCurrentFunction",
         "title": "Flutter Tools: Select Current Function"
       },

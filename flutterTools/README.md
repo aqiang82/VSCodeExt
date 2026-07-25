@@ -8,6 +8,12 @@ flutterTools.generateModelFromJson
 flutterTools.selectCurrentWidget
 根据当前的光标，选中当前的widget
 
+flutterTools.removeObxParent
+移除光标所在 Widget 最近一层的 Obx 包装
+
+flutterTools.removeGetBuilderParent
+移除光标所在 Widget 最近一层的 GetBuilder 包装
+
 flutterTools.generateConstructorParams
 根据当前的光标，生成当前类的构造函数和参数。
 
