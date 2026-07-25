@@ -9,6 +9,12 @@ import {
 	findWidgetUnwrapEdit,
 	RemovableWidgetWrapper
 } from './dart_widget_unwrapper';
+import {
+	classifyVariableReference,
+	createFieldWatchInstrumentation,
+	findExistingFieldWatch,
+	VariableWatchMode
+} from './dart_variable_watch';
 
 let extensionContextRef: vscode.ExtensionContext | undefined;
 
@@ -61,6 +67,52 @@ export function activate(context: vscode.ExtensionContext) {
 
 	context.subscriptions.push(
 		vscode.commands.registerCommand('flutterTools.removeGetBuilderParent', removeGetBuilderParentFunction)
+	);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand('flutterTools.watchVariableAccess', watchVariableAccessFunction)
+	);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand(
+			'flutterTools.watchVariableReads',
+			() => watchVariableAccessByMode('read')
+		)
+	);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand(
+			'flutterTools.watchVariableWrites',
+			() => watchVariableAccessByMode('write')
+		)
+	);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand(
+			'flutterTools.watchVariableReadsAndWrites',
+			() => watchVariableAccessByMode('both')
+		)
+	);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand(
+			'flutterTools.breakOnRxValueWrites',
+			breakOnRxValueWritesFunction
+		)
+	);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand(
+			'flutterTools.removeVariableWatch',
+			removeVariableWatchFunction
+		)
+	);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand(
+			'flutterTools.clearVariableWatchBreakpoints',
+			clearVariableWatchBreakpointsFunction
+		)
 	);
 
 	context.subscriptions.push(
@@ -136,7 +188,18 @@ type WorkspaceFileQuickPickItem = vscode.QuickPickItem & {
 	highlights?: QuickPickHighlightRanges;
 };
 
+type VariableWatchQuickPickItem = vscode.QuickPickItem & {
+	mode: VariableWatchMode;
+};
+
+type ResolvedVariableTarget = {
+	uri: vscode.Uri;
+	position: vscode.Position;
+	range: vscode.Range;
+};
+
 const recentSearchFilesStorageKey = 'flutterTools.searchFiles.recentFiles';
+const variableWatchBreakpointIdsStorageKey = 'flutterTools.variableWatch.breakpointIds';
 const maxRecentSearchFiles = 100;
 const maxSearchResultFiles = 200;
 const flutterSearchExcludeGlob = '**/{.git,.svn,.hg,.dart_tool,.fvm,.idea,.gradle,build,dist,node_modules,Pods,.symlinks,.plugin_symlinks}/**';
@@ -800,6 +863,445 @@ function indentBlock(code: string, indent: string): string {
 		.join('\n');
 }
 
+function getTrackedVariableBreakpointIds(): Set<string> {
+	return new Set(
+		extensionContextRef?.workspaceState.get<string[]>(variableWatchBreakpointIdsStorageKey) ?? []
+	);
+}
+
+async function setTrackedVariableBreakpointIds(ids: Set<string>): Promise<void> {
+	await extensionContextRef?.workspaceState.update(
+		variableWatchBreakpointIdsStorageKey,
+		[...ids]
+	);
+}
+
+function isLocationLink(
+	location: vscode.Location | vscode.LocationLink
+): location is vscode.LocationLink {
+	return 'targetUri' in location;
+}
+
+function getIdentifierRangeAtPosition(
+	document: vscode.TextDocument,
+	position: vscode.Position
+): vscode.Range | undefined {
+	return document.getWordRangeAtPosition(position, /[A-Za-z_$][A-Za-z0-9_$]*/);
+}
+
+function getRxTargetPosition(
+	document: vscode.TextDocument,
+	position: vscode.Position
+): vscode.Position {
+	const wordRange = getIdentifierRangeAtPosition(document, position);
+	if (!wordRange || document.getText(wordRange) !== 'value') {
+		return position;
+	}
+
+	const linePrefix = document
+		.lineAt(position.line)
+		.text
+		.slice(0, wordRange.start.character);
+	const previousIdentifier = linePrefix.match(/([A-Za-z_$][A-Za-z0-9_$]*)\s*\.\s*$/);
+	if (!previousIdentifier || previousIdentifier.index === undefined) {
+		return position;
+	}
+
+	const identifierStart =
+		previousIdentifier.index +
+		previousIdentifier[0].indexOf(previousIdentifier[1]);
+	return new vscode.Position(position.line, identifierStart);
+}
+
+async function resolveVariableTarget(
+	adjustRxValueSelection = false
+): Promise<ResolvedVariableTarget | undefined> {
+	const editor = vscode.window.activeTextEditor;
+	if (!editor) {
+		vscode.window.showInformationMessage('No active editor');
+		return undefined;
+	}
+	if (editor.document.languageId !== 'dart') {
+		vscode.window.showInformationMessage('Variable watch only supports Dart files.');
+		return undefined;
+	}
+
+	const cursorPosition = editor.selection.isEmpty
+		? editor.selection.active
+		: editor.selection.start;
+	const selectedPosition = adjustRxValueSelection
+		? getRxTargetPosition(editor.document, cursorPosition)
+		: cursorPosition;
+	const selectedRange = getIdentifierRangeAtPosition(editor.document, selectedPosition);
+	if (!selectedRange) {
+		vscode.window.showInformationMessage('Place the cursor on a variable first.');
+		return undefined;
+	}
+
+	const definitions = await vscode.commands.executeCommand<
+		Array<vscode.Location | vscode.LocationLink>
+	>(
+		'vscode.executeDefinitionProvider',
+		editor.document.uri,
+		selectedPosition
+	);
+	const preferredDefinition = definitions?.find(definition => {
+		const uri = isLocationLink(definition) ? definition.targetUri : definition.uri;
+		return uri.scheme === 'file' && !!vscode.workspace.getWorkspaceFolder(uri);
+	}) ?? definitions?.[0];
+
+	if (!preferredDefinition) {
+		return {
+			uri: editor.document.uri,
+			position: selectedRange.start,
+			range: selectedRange
+		};
+	}
+
+	if (isLocationLink(preferredDefinition)) {
+		const targetRange =
+			preferredDefinition.targetSelectionRange ??
+			preferredDefinition.targetRange;
+		return {
+			uri: preferredDefinition.targetUri,
+			position: targetRange.start,
+			range: targetRange
+		};
+	}
+
+	return {
+		uri: preferredDefinition.uri,
+		position: preferredDefinition.range.start,
+		range: preferredDefinition.range
+	};
+}
+
+async function addTrackedSourceBreakpoints(
+	locations: vscode.Location[]
+): Promise<number> {
+	const existingLocations = new Set(
+		vscode.debug.breakpoints
+			.filter((breakpoint): breakpoint is vscode.SourceBreakpoint =>
+				breakpoint instanceof vscode.SourceBreakpoint
+			)
+			.map(breakpoint =>
+				`${breakpoint.location.uri.toString()}:${breakpoint.location.range.start.line}`
+			)
+	);
+	const uniqueLocations = new Map<string, vscode.Location>();
+	for (const location of locations) {
+		const key = `${location.uri.toString()}:${location.range.start.line}`;
+		if (!existingLocations.has(key)) {
+			uniqueLocations.set(key, location);
+		}
+	}
+
+	const breakpoints = [...uniqueLocations.values()].map(location => {
+		const linePosition = new vscode.Position(location.range.start.line, 0);
+		return new vscode.SourceBreakpoint(
+			new vscode.Location(location.uri, linePosition),
+			true
+		);
+	});
+	if (breakpoints.length === 0) {
+		return 0;
+	}
+
+	vscode.debug.addBreakpoints(breakpoints);
+	const trackedIds = getTrackedVariableBreakpointIds();
+	for (const breakpoint of breakpoints) {
+		trackedIds.add(breakpoint.id);
+	}
+	await setTrackedVariableBreakpointIds(trackedIds);
+	return breakpoints.length;
+}
+
+async function removeTrackedBreakpoints(
+	predicate?: (breakpoint: vscode.SourceBreakpoint) => boolean
+): Promise<number> {
+	const trackedIds = getTrackedVariableBreakpointIds();
+	const breakpoints = vscode.debug.breakpoints.filter(
+		(breakpoint): breakpoint is vscode.SourceBreakpoint =>
+			breakpoint instanceof vscode.SourceBreakpoint &&
+			trackedIds.has(breakpoint.id) &&
+			(!predicate || predicate(breakpoint))
+	);
+	if (breakpoints.length === 0) {
+		return 0;
+	}
+
+	vscode.debug.removeBreakpoints(breakpoints);
+	for (const breakpoint of breakpoints) {
+		trackedIds.delete(breakpoint.id);
+	}
+	await setTrackedVariableBreakpointIds(trackedIds);
+	return breakpoints.length;
+}
+
+async function getVariableReferences(
+	target: ResolvedVariableTarget
+): Promise<vscode.Location[]> {
+	return (
+		await vscode.commands.executeCommand<vscode.Location[]>(
+			'vscode.executeReferenceProvider',
+			target.uri,
+			target.position
+		)
+	) ?? [];
+}
+
+function shouldBreakForMode(
+	mode: VariableWatchMode,
+	kind: { read: boolean; write: boolean }
+): boolean {
+	if (mode === 'read') {
+		return kind.read;
+	}
+	if (mode === 'write') {
+		return kind.write;
+	}
+	return kind.read || kind.write;
+}
+
+async function getReferenceBreakpointLocations(
+	target: ResolvedVariableTarget,
+	mode: VariableWatchMode,
+	rxValueWritesOnly: boolean
+): Promise<vscode.Location[]> {
+	const references = await getVariableReferences(target);
+	const documents = new Map<string, vscode.TextDocument>();
+	const locations: vscode.Location[] = [];
+
+	for (const reference of references) {
+		if (
+			reference.uri.toString() === target.uri.toString() &&
+			reference.range.contains(target.position)
+		) {
+			continue;
+		}
+
+		const uriKey = reference.uri.toString();
+		let document = documents.get(uriKey);
+		if (!document) {
+			document = await vscode.workspace.openTextDocument(reference.uri);
+			documents.set(uriKey, document);
+		}
+
+		const range =
+			getIdentifierRangeAtPosition(document, reference.range.start) ??
+			reference.range;
+		const start = document.offsetAt(range.start);
+		const end = document.offsetAt(range.end);
+		const kind = classifyVariableReference(document.getText(), start, end);
+		const matches = rxValueWritesOnly
+			? kind.rxValueWrite
+			: shouldBreakForMode(mode, kind);
+		if (matches) {
+			locations.push(new vscode.Location(reference.uri, range.start));
+		}
+	}
+
+	return locations;
+}
+
+async function addInstrumentedFieldBreakpoints(
+	document: vscode.TextDocument,
+	readOffset: number,
+	writeOffset: number,
+	mode: VariableWatchMode
+): Promise<number> {
+	const locations: vscode.Location[] = [];
+	if (mode === 'read' || mode === 'both') {
+		locations.push(
+			new vscode.Location(document.uri, document.positionAt(readOffset))
+		);
+	}
+	if (mode === 'write' || mode === 'both') {
+		locations.push(
+			new vscode.Location(document.uri, document.positionAt(writeOffset))
+		);
+	}
+	return addTrackedSourceBreakpoints(locations);
+}
+
+async function watchVariableAccessFunction() {
+	const selected = await vscode.window.showQuickPick<VariableWatchQuickPickItem>(
+		[
+			{
+				label: 'Break on Writes',
+				description: 'Recommended',
+				detail: 'Pause when a new value is assigned; shows old value, new value, and call stack.',
+				mode: 'write'
+			},
+			{
+				label: 'Break on Reads',
+				detail: 'Pause whenever application code reads the field. This may trigger frequently.',
+				mode: 'read'
+			},
+			{
+				label: 'Break on Reads and Writes',
+				detail: 'Add breakpoints to both the getter and setter.',
+				mode: 'both'
+			}
+		],
+		{
+			placeHolder: 'Choose which variable accesses should pause the debugger'
+		}
+	);
+	if (!selected) {
+		return;
+	}
+
+	await watchVariableAccessByMode(selected.mode);
+}
+
+async function watchVariableAccessByMode(mode: VariableWatchMode) {
+	const target = await resolveVariableTarget();
+	if (!target) {
+		return;
+	}
+
+	const document = await vscode.workspace.openTextDocument(target.uri);
+	const declarationOffset = document.offsetAt(target.position);
+	const existingWatch = findExistingFieldWatch(document.getText(), declarationOffset);
+	if (existingWatch) {
+		const count = await addInstrumentedFieldBreakpoints(
+			document,
+			existingWatch.readBreakpointOffset,
+			existingWatch.writeBreakpointOffset,
+			mode
+		);
+		vscode.window.showInformationMessage(
+			count > 0
+				? `${existingWatch.fieldName}: variable watch breakpoint added.`
+				: `${existingWatch.fieldName}: matching breakpoint already exists.`
+		);
+		return;
+	}
+
+	const markerId =
+		`${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+	const instrumentation = createFieldWatchInstrumentation(
+		document.getText(),
+		declarationOffset,
+		markerId
+	);
+	if (instrumentation) {
+		const edit = new vscode.WorkspaceEdit();
+		edit.replace(
+			document.uri,
+			new vscode.Range(
+				document.positionAt(instrumentation.start),
+				document.positionAt(instrumentation.end)
+			),
+			instrumentation.replacement
+		);
+		const applied = await vscode.workspace.applyEdit(edit);
+		if (!applied) {
+			vscode.window.showErrorMessage('Failed to instrument the variable.');
+			return;
+		}
+
+		const updatedDocument = await vscode.workspace.openTextDocument(document.uri);
+		const count = await addInstrumentedFieldBreakpoints(
+			updatedDocument,
+			instrumentation.start + instrumentation.readBreakpointOffset,
+			instrumentation.start + instrumentation.writeBreakpointOffset,
+			mode
+		);
+		vscode.window.showInformationMessage(
+			`${instrumentation.fieldName}: temporary getter/setter created and ${count} breakpoint(s) added. Save the file; Hot Restart may be required.`
+		);
+		return;
+	}
+
+	const locations = await getReferenceBreakpointLocations(target, mode, false);
+	const count = await addTrackedSourceBreakpoints(locations);
+	if (locations.length === 0) {
+		vscode.window.showInformationMessage(
+			'This declaration cannot be safely converted, and no matching references were found.'
+		);
+		return;
+	}
+
+	vscode.window.showInformationMessage(
+		`The field was not modified; ${count} breakpoint(s) were added to matching ${mode} reference lines.`
+	);
+}
+
+async function breakOnRxValueWritesFunction() {
+	const target = await resolveVariableTarget(true);
+	if (!target) {
+		return;
+	}
+
+	const locations = await getReferenceBreakpointLocations(target, 'write', true);
+	if (locations.length === 0) {
+		vscode.window.showInformationMessage(
+			'No .value assignments were found for this Rx variable.'
+		);
+		return;
+	}
+
+	const count = await addTrackedSourceBreakpoints(locations);
+	vscode.window.showInformationMessage(
+		count > 0
+			? `Added ${count} breakpoint(s) to Rx .value writes.`
+			: 'Breakpoints already exist on all detected Rx .value writes.'
+	);
+}
+
+async function removeVariableWatchFunction() {
+	const target = await resolveVariableTarget();
+	if (!target) {
+		return;
+	}
+
+	const document = await vscode.workspace.openTextDocument(target.uri);
+	const targetOffset = document.offsetAt(target.position);
+	const existingWatch = findExistingFieldWatch(document.getText(), targetOffset);
+	if (!existingWatch) {
+		vscode.window.showInformationMessage('No temporary variable watch found.');
+		return;
+	}
+
+	const startLine = document.positionAt(existingWatch.start).line;
+	const endLine = document.positionAt(existingWatch.end).line;
+	await removeTrackedBreakpoints(breakpoint =>
+		breakpoint.location.uri.toString() === document.uri.toString() &&
+		breakpoint.location.range.start.line >= startLine &&
+		breakpoint.location.range.start.line <= endLine
+	);
+
+	const edit = new vscode.WorkspaceEdit();
+	edit.replace(
+		document.uri,
+		new vscode.Range(
+			document.positionAt(existingWatch.start),
+			document.positionAt(existingWatch.end)
+		),
+		existingWatch.originalText
+	);
+	const applied = await vscode.workspace.applyEdit(edit);
+	if (!applied) {
+		vscode.window.showErrorMessage('Failed to restore the original field.');
+		return;
+	}
+
+	vscode.window.showInformationMessage(
+		`${existingWatch.fieldName}: original field restored and watch breakpoints removed.`
+	);
+}
+
+async function clearVariableWatchBreakpointsFunction() {
+	const count = await removeTrackedBreakpoints();
+	vscode.window.showInformationMessage(
+		count > 0
+			? `Cleared ${count} variable watch breakpoint(s).`
+			: 'No Flutter Tools variable watch breakpoints found.'
+	);
+}
+
 class DartObxWrapCodeActionProvider implements vscode.CodeActionProvider {
 	provideCodeActions(document: vscode.TextDocument, range: vscode.Range): vscode.CodeAction[] {
 		if (document.languageId !== 'dart') {
@@ -824,6 +1326,15 @@ class DartObxWrapCodeActionProvider implements vscode.CodeActionProvider {
 			selectionEnd,
 			'GetBuilder'
 		);
+		const variableWordRange = document.getWordRangeAtPosition(
+			range.start,
+			/[A-Za-z_$][A-Za-z0-9_$]*/
+		);
+		const canWatchVariable = !!variableWordRange;
+		const existingVariableWatch = findExistingFieldWatch(
+			document.getText(),
+			selectionStart
+		);
 		// 只有能确定目标时才展示 Rewrite 动作，减少无效噪音。
 		if (
 			!hasSelection &&
@@ -831,7 +1342,8 @@ class DartObxWrapCodeActionProvider implements vscode.CodeActionProvider {
 			!canDetectFunction &&
 			!canDetectClass &&
 			!canRemoveObx &&
-			!canRemoveGetBuilder
+			!canRemoveGetBuilder &&
+			!canWatchVariable
 		) {
 			return [];
 		}
@@ -890,6 +1402,40 @@ class DartObxWrapCodeActionProvider implements vscode.CodeActionProvider {
 			removeActions.push(removeGetBuilderAction);
 		}
 
+		const variableWatchActions: vscode.CodeAction[] = [];
+		if (canWatchVariable) {
+			const watchVariableAction = new vscode.CodeAction(
+				'Watch Variable Access...',
+				vscode.CodeActionKind.RefactorRewrite
+			);
+			watchVariableAction.command = {
+				command: 'flutterTools.watchVariableAccess',
+				title: 'Watch Variable Access...'
+			};
+			variableWatchActions.push(watchVariableAction);
+
+			const watchRxAction = new vscode.CodeAction(
+				'Break on Rx .value Writes',
+				vscode.CodeActionKind.RefactorRewrite
+			);
+			watchRxAction.command = {
+				command: 'flutterTools.breakOnRxValueWrites',
+				title: 'Break on Rx .value Writes'
+			};
+			variableWatchActions.push(watchRxAction);
+		}
+		if (existingVariableWatch) {
+			const removeWatchAction = new vscode.CodeAction(
+				'Remove Variable Watch',
+				vscode.CodeActionKind.RefactorRewrite
+			);
+			removeWatchAction.command = {
+				command: 'flutterTools.removeVariableWatch',
+				title: 'Remove Variable Watch'
+			};
+			variableWatchActions.push(removeWatchAction);
+		}
+
 		const selectFunctionAction = new vscode.CodeAction('Select Current Function', vscode.CodeActionKind.RefactorRewrite);
 		selectFunctionAction.command = {
 			command: 'flutterTools.selectCurrentFunction',
@@ -909,6 +1455,7 @@ class DartObxWrapCodeActionProvider implements vscode.CodeActionProvider {
 			layoutBuilderAction,
 			getBuilderAction,
 			...removeActions,
+			...variableWatchActions,
 			selectFunctionAction,
 			overrideMethodsAction
 		];

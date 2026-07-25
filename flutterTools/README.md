@@ -14,6 +14,18 @@ flutterTools.removeObxParent
 flutterTools.removeGetBuilderParent
 移除光标所在 Widget 最近一层的 GetBuilder 包装
 
+flutterTools.watchVariableAccess
+监视普通变量的读取或写入；简单类字段会临时生成 getter/setter 并自动添加断点
+
+flutterTools.breakOnRxValueWrites
+查找当前 GetX Rx 变量的所有 `.value` 写入位置并添加断点
+
+flutterTools.removeVariableWatch
+恢复被临时转换的字段并移除对应断点
+
+flutterTools.clearVariableWatchBreakpoints
+清除本插件添加的变量监视断点
+
 flutterTools.generateConstructorParams
 根据当前的光标，生成当前类的构造函数和参数。
 

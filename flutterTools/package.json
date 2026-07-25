@@ -60,6 +60,34 @@
         "title": "Flutter Tools: Remove GetBuilder Parent"
       },
       {
+        "command": "flutterTools.watchVariableAccess",
+        "title": "Flutter Tools: Watch Variable Access..."
+      },
+      {
+        "command": "flutterTools.watchVariableReads",
+        "title": "Flutter Tools: Watch Variable Reads"
+      },
+      {
+        "command": "flutterTools.watchVariableWrites",
+        "title": "Flutter Tools: Watch Variable Writes"
+      },
+      {
+        "command": "flutterTools.watchVariableReadsAndWrites",
+        "title": "Flutter Tools: Watch Variable Reads and Writes"
+      },
+      {
+        "command": "flutterTools.breakOnRxValueWrites",
+        "title": "Flutter Tools: Break on Rx .value Writes"
+      },
+      {
+        "command": "flutterTools.removeVariableWatch",
+        "title": "Flutter Tools: Remove Variable Watch"
+      },
+      {
+        "command": "flutterTools.clearVariableWatchBreakpoints",
+        "title": "Flutter Tools: Clear Variable Watch Breakpoints"
+      },
+      {
         "command": "flutterTools.selectCurrentFunction",
         "title": "Flutter Tools: Select Current Function"
       },
