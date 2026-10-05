@@ -2,7 +2,7 @@
   "name": "flutter-tools",
   "displayName": "flutterTools",
   "description": "flutter tools",
-  "version": "0.0.14",
+  "version": "0.0.15",
   "engines": {
     "vscode": "^1.101.0"
   },
@@ -102,9 +102,19 @@
     {
     "command": "flutterTools.searchFiles",
     "title": "Flutter Tools: Search Files"
+      },
+      {
+        "command": "flutterTools.copyRelativePathWithLine",
+        "title": "Flutter Tools: Copy Relative Path with Line"
       }
     ],
     "menus": {
+      "editor/context": [
+        {
+          "command": "flutterTools.copyRelativePathWithLine",
+          "group": "9_cutcopypaste"
+        }
+      ],
     "explorer/context": [
         {
           "command": "flutterTools.generateGetXModule",

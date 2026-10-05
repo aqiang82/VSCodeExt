@@ -32,6 +32,9 @@ flutterTools.generateConstructorParams
 flutterTools.generateGetXModule
 生成一套基本的公用的getX模版,支持驼峰命名和下划线命名(目录哪里右键会出现)
 
+flutterTools.copyRelativePathWithLine
+复制当前文件相对项目的路径和行号，如 `lib/main.dart:155`；选中多行时为 `lib/main.dart:100-120`（编辑器右键菜单也有）
+
 #开发说明
 记住运行之前先用命令编译才会生效：
 npm run compile

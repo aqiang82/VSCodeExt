@@ -15,6 +15,7 @@ import {
 	findExistingFieldWatch,
 	VariableWatchMode
 } from './dart_variable_watch';
+import { formatPathWithLines } from './path_with_line';
 
 let extensionContextRef: vscode.ExtensionContext | undefined;
 
@@ -129,6 +130,11 @@ export function activate(context: vscode.ExtensionContext) {
 
 	context.subscriptions.push(
 		vscode.commands.registerCommand('flutterTools.searchFiles', searchProjectFilesFunction)
+	);
+
+	// 命令: 复制相对项目的路径 + 行号，如 lib/main.dart:155 或 lib/main.dart:100-120
+	context.subscriptions.push(
+		vscode.commands.registerCommand('flutterTools.copyRelativePathWithLine', copyRelativePathWithLineFunction)
 	);
 
 	context.subscriptions.push(
@@ -1517,6 +1523,28 @@ async function generateOverrideMethodsFunction() {
 	}
 
 	vscode.window.showInformationMessage('Override methods generated.');
+}
+
+async function copyRelativePathWithLineFunction() {
+	const editor = vscode.window.activeTextEditor;
+	if (!editor) {
+		vscode.window.showInformationMessage('No active editor');
+		return;
+	}
+
+	// 不在工作区内的文件会返回绝对路径。
+	const relativePath = vscode.workspace.asRelativePath(editor.document.uri);
+	const text = formatPathWithLines(
+		relativePath,
+		editor.selections.map(selection => ({
+			startLine: selection.start.line,
+			endLine: selection.end.line,
+			endCharacter: selection.end.character
+		}))
+	);
+
+	await vscode.env.clipboard.writeText(text);
+	vscode.window.setStatusBarMessage(`已复制: ${text.split('\n').join(', ')}`, 3000);
 }
 
 function selectCurrentFunctionFunction() {
